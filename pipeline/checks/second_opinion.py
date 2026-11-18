@@ -40,5 +40,95 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    preds = get_preds(ds, cfg, "checker") if preds is None else preds
+    c = cfg["second_opinion"]
+    conf_thr = c["conf"]
+    min_area_px = c["min_area_px"]
+    fp_conf = c["fp_conf"]
+    iou_missing = c["iou_missing"]
+    iou_match = c["iou_match"]
+    iou_loose = c["iou_loose"]
+    issues = []
+
+    for img_path in ds.image_files():
+        stem = img_path.stem
+        if stem not in preds:
+            continue
+        raw_lines = ds.read_label_lines(stem)
+        if raw_lines is None:
+            continue
+        size = ds.image_size(stem)
+        if size is None:
+            continue
+        im_w, im_h = size
+
+        label_boxes = []
+        for line_no, text in raw_lines:
+            try:
+                cid, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= cid < len(ds.classes):
+                label_boxes.append((line_no, cid, cx, cy, w, h))
+
+        img_preds = preds[stem]
+        for pr in img_preds:
+            pcid, pconf, pcx, pcy, pw, ph = pr
+            if pconf < conf_thr or (pw * im_w) * (ph * im_h) < min_area_px:
+                continue
+            pbox = (pcx, pcy, pw, ph)
+            cands = []
+            for lno, lcid, lcx, lcy, lw, lh in label_boxes:
+                iou = iou_xywh(pbox, (lcx, lcy, lw, lh))
+                if iou >= iou_missing:
+                    cands.append((lno, lcid, iou))
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion",
+                    WARN,
+                    "POSSIBLE_MISSING",
+                    stem,
+                    f"model thấy {ds.classes[pcid]} ({pconf:.2f})",
+                    extra={"conf": round(float(pconf), 4)},
+                ))
+                continue
+            same = [x for x in cands if x[1] == pcid]
+            if same:
+                best_same_iou = max(x[2] for x in same)
+                if best_same_iou < iou_loose:
+                    issues.append(Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_LOOSE_BOX",
+                        stem,
+                        f"box {ds.classes[pcid]} có IoU={best_same_iou:.2f}",
+                        extra={"conf": round(float(pconf), 4), "iou": round(float(best_same_iou), 4)},
+                    ))
+            else:
+                best_other = max(cands, key=lambda x: x[2])
+                if best_other[2] >= iou_match:
+                    issues.append(Issue(
+                        "second_opinion",
+                        WARN,
+                        "POSSIBLE_WRONG_CLASS",
+                        stem,
+                        f"nhãn {ds.classes[best_other[1]]} vs model {ds.classes[pcid]}",
+                        extra={"conf": round(float(pconf), 4), "iou": round(float(best_other[2]), 4)},
+                    ))
+
+        fp_preds = [pr for pr in img_preds if pr[1] >= fp_conf]
+        for lno, lcid, lcx, lcy, lw, lh in label_boxes:
+            lbox = (lcx, lcy, lw, lh)
+            max_iou = max((iou_xywh(lbox, (pr[2], pr[3], pr[4], pr[5])) for pr in fp_preds), default=0.0)
+            if max_iou < iou_missing:
+                issues.append(Issue(
+                    "second_opinion",
+                    WARN,
+                    "POSSIBLE_FALSE_POS",
+                    stem,
+                    f"box {ds.classes[lcid]} không khớp dự đoán nào",
+                    line=lno,
+                    extra={"iou": round(float(max_iou), 4)},
+                ))
+
+    return issues

@@ -35,5 +35,118 @@ from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    errors = [i for i in issues if i.severity == ERROR]
+    removed_stems = set()
+    line_ops = defaultdict(dict)
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    remove_prefixes = ("DUP_IMAGE_",)
+    remove_codes = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+    for issue in errors:
+        code = issue.code
+        if code == "BAD_CLASS_NAME":
+            if ds.yaml_path.exists():
+                data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+                before_names = data.get("names", {})
+                data["names"] = list(cfg["classes"])
+                ds.yaml_path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+                fixes.append({
+                    "image": "data.yaml",
+                    "line": "",
+                    "action": "rename_classes",
+                    "before": str(before_names),
+                    "after": str(data["names"]),
+                })
+        elif code == "MISSING_LABEL_FILE":
+            fixes.append({
+                "image": issue.image,
+                "line": "",
+                "action": "needs_label",
+                "before": "(không có file)",
+                "after": "chuyển người gán",
+            })
+        elif code in remove_codes or any(code.startswith(p) for p in remove_prefixes):
+            stem = issue.image
+            if stem in removed_stems:
+                continue
+            img_p = ds.image_path(stem)
+            lbl_p = ds.label_path(stem)
+            before_name = img_p.name if img_p is not None else stem
+            if img_p is not None and img_p.exists():
+                img_p.unlink()
+            if lbl_p.exists():
+                lbl_p.unlink()
+            removed_stems.add(stem)
+            fixes.append({
+                "image": stem,
+                "line": "",
+                "action": "remove_image",
+                "before": before_name,
+                "after": "(đã xoá)",
+            })
+        elif code in drop_codes and issue.line is not None:
+            line_ops[issue.image][issue.line] = "drop"
+        elif code == "BOX_OUT_OF_IMAGE" and issue.line is not None:
+            if line_ops[issue.image].get(issue.line) != "drop":
+                line_ops[issue.image][issue.line] = "clip"
+
+    for stem, ops in line_ops.items():
+        if stem in removed_stems:
+            continue
+        lbl_p = ds.label_path(stem)
+        if not lbl_p.exists():
+            continue
+        orig_lines = lbl_p.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        for idx, orig in enumerate(orig_lines, 1):
+            op = ops.get(idx)
+            if op == "drop":
+                fixes.append({
+                    "image": stem,
+                    "line": idx,
+                    "action": "drop_line",
+                    "before": orig,
+                    "after": "(đã xoá)",
+                })
+            elif op == "clip":
+                try:
+                    cid, cx, cy, w, h = parse_yolo_line(orig)
+                except ValueError:
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": orig,
+                        "after": "(đã xoá)",
+                    })
+                    continue
+                x1 = max(0.0, min(1.0, cx - w / 2))
+                y1 = max(0.0, min(1.0, cy - h / 2))
+                x2 = max(0.0, min(1.0, cx + w / 2))
+                y2 = max(0.0, min(1.0, cy + h / 2))
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 0 or nh <= 0:
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": orig,
+                        "after": "(đã xoá)",
+                    })
+                    continue
+                ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                clipped = f"{cid} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                new_lines.append(clipped)
+                fixes.append({
+                    "image": stem,
+                    "line": idx,
+                    "action": "clip_box",
+                    "before": orig,
+                    "after": clipped,
+                })
+            else:
+                new_lines.append(orig)
+        lbl_p.write_text(("\n".join(new_lines) + "\n") if new_lines else "", encoding="utf-8")
+
+    return fixes
